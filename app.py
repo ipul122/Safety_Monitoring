@@ -2,21 +2,21 @@
 
 Dua mode (dipilih lewat dropdown "Mode" di sidebar kiri):
     1. Images : unggah foto atau pakai gambar contoh, lalu lihat hasil deteksinya.
-    2. Video  : deteksi langsung pada video contoh (folder videos), link YouTube,
-                atau file video unggahan.
+    2. Video  : pilih video (folder videos, link YouTube, atau unggahan). Seluruh
+                video diproses dulu, lalu hasilnya diputar mulus beserta suaranya.
 
 Cara menjalankan:
     streamlit run app.py
 """
 
+import subprocess
 import tempfile
-import time
 from collections import Counter
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
 import numpy as np
 import streamlit as st
 import yt_dlp
@@ -37,19 +37,20 @@ SOURCE_UPLOAD = "Unggah gambar"
 SOURCE_SAMPLE = "Gambar contoh"
 
 IMAGE_SIZE = 800  # sama dengan ukuran gambar saat training (mode gambar)
-VIDEO_IMAGE_SIZE = 800  # ukuran masuk model untuk video; turunkan ke 640 jika terasa lambat
+VIDEO_IMAGE_SIZE = 640  # ukuran masuk model untuk video; lebih kecil = lebih cepat
 
 # Video contoh: semua file di folder ini muncul otomatis di dropdown.
 VIDEOS_DIR = Path(__file__).parent / "videos"
 CUSTOM_VIDEO = "Link YouTube lain..."
 UPLOAD_VIDEO = "Unggah file video"
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
-
-# Untuk link YouTube: pilih codec H.264 (avc1) karena paling mudah dibaca OpenCV,
-# dengan sisi terpendek video maksimal sekian piksel (juga untuk video vertikal).
-YOUTUBE_FORMAT = "bestvideo[vcodec^=avc1][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
-YOUTUBE_RESOLUTION = 480
+MAX_OUTPUT_SIDE = 1280  # video besar diperkecil agar proses & pemutaran ringan
 FALLBACK_VIDEO_FPS = 25  # dipakai jika FPS video tidak terbaca
+
+# Untuk link YouTube: gambar H.264 (avc1) + suara m4a, dengan sisi terpendek
+# video maksimal sekian piksel (juga untuk video vertikal).
+YOUTUBE_FORMAT = "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+YOUTUBE_RESOLUTION = 480
 
 # Warna kotak deteksi per kelas (RGB)
 BOX_COLORS = {
@@ -97,6 +98,26 @@ class VideoSource:
     @property
     def is_empty(self) -> bool:
         return self.file is None and not self.youtube_url and self.upload is None
+
+    @property
+    def key(self) -> str:
+        """Penanda unik sumber, untuk tahu apakah hasil tersimpan masih cocok."""
+        if self.file is not None:
+            return f"file:{self.file.name}:{self.file.stat().st_mtime}"
+        if self.upload is not None:
+            return f"upload:{self.upload.file_id}"
+        return f"youtube:{self.youtube_url}"
+
+
+@dataclass(frozen=True)
+class VideoResult:
+    """Hasil pemrosesan satu video."""
+
+    video: bytes  # file mp4 yang sudah diberi kotak deteksi
+    is_portrait: bool
+    has_audio: bool
+    max_counts: Counter  # jumlah terbanyak tiap kelas dalam satu frame
+    violations: dict[str, list[int]]  # {kelas pelanggaran: daftar detik}
 
 
 @dataclass(frozen=True)
@@ -247,47 +268,164 @@ def draw_detections(image_rgb: np.ndarray, detections: list[Detection]) -> Image
 
 
 # ---------------------------------------------------------------------------
-# Fungsi bantu: video YouTube
+# Memproses video
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_stream_url(youtube_url: str, resolution: int) -> str:
-    """Mengambil alamat stream langsung dari link YouTube (tanpa mengunduh)."""
-    with yt_dlp.YoutubeDL(youtube_options(resolution)) as downloader:
-        info = downloader.extract_info(youtube_url, download=False)
-    return info["url"]
-
-
-def download_video(youtube_url: str, resolution: int, folder: str) -> str:
-    """Mengunduh video YouTube ke `folder`. Mengembalikan path file hasil unduhan."""
-    options = {**youtube_options(resolution), "outtmpl": f"{folder}/video.%(ext)s"}
-    with yt_dlp.YoutubeDL(options) as downloader:
-        info = downloader.extract_info(youtube_url, download=True)
-        return downloader.prepare_filename(info)
-
-
-def youtube_options(resolution: int) -> dict:
-    """Pengaturan yt-dlp. `resolution` = batas sisi terpendek (juga untuk video vertikal)."""
-    return {
+def download_youtube(youtube_url: str, folder: Path) -> Path:
+    """Mengunduh video YouTube (gambar + suara) ke `folder`."""
+    options = {
         "format": YOUTUBE_FORMAT,
-        "format_sort": [f"res:{resolution}"],
+        "format_sort": [f"res:{YOUTUBE_RESOLUTION}"],
+        "merge_output_format": "mp4",
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+        "outtmpl": str(folder / "youtube.%(ext)s"),
         "quiet": True,
         "noprogress": True,
         "noplaylist": True,
     }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        downloader.download([youtube_url])
+    return next(folder.glob("youtube.*"))
 
 
-def sample_frames(capture: cv2.VideoCapture, step: int, max_frames: int):
-    """Mengambil 1 frame dari setiap `step` frame, sampai `max_frames` frame.
+def get_video_path(source: VideoSource, folder: Path) -> Path:
+    """Menyediakan file video lokal dari sumber yang dipilih."""
+    if source.file is not None:
+        return source.file
 
-    Frame yang dilewati hanya di-`grab` (tidak didecode penuh) sehingga ringan.
+    if source.upload is not None:
+        path = folder / f"unggahan{Path(source.upload.name).suffix}"
+        path.write_bytes(source.upload.getbuffer())
+        return path
+
+    with st.spinner("Mengunduh video dari YouTube..."):
+        return download_youtube(source.youtube_url, folder)
+
+
+def limit_size(frame: np.ndarray) -> np.ndarray:
+    """Memperkecil frame jika sisi terpanjangnya melebihi MAX_OUTPUT_SIDE."""
+    scale = MAX_OUTPUT_SIDE / max(frame.shape[:2])
+    if scale >= 1:
+        return frame
+    return cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def open_writer(path: Path, frame: np.ndarray, fps: float):
+    """Membuka penulis video H.264 (format yang bisa diputar browser)."""
+    height, width = frame.shape[:2]
+    writer = imageio_ffmpeg.write_frames(
+        str(path),
+        size=(width, height),
+        fps=fps,
+        codec="libx264",
+        pix_fmt_in="bgr24",
+        macro_block_size=2,  # H.264 butuh lebar & tinggi genap
+        quality=None,
+        output_params=["-preset", "veryfast", "-crf", "23"],
+    )
+    writer.send(None)  # wajib sebelum mengirim frame pertama
+    return writer
+
+
+def annotate_video(
+    video_path: Path, output_path: Path, settings: Settings, detect_fps: int, max_seconds: int
+) -> tuple[float, Counter, dict[str, list[int]], bool]:
+    """Membuat video baru (tanpa suara) berisi kotak deteksi.
+
+    Semua frame ditulis agar hasilnya mulus, tetapi deteksi hanya dijalankan
+    `detect_fps` kali per detik; kotak terakhir dipakai untuk frame di antaranya.
+    Mengembalikan (durasi detik, jumlah terbanyak, detik pelanggaran, video vertikal?).
     """
-    for _ in range(max_frames):
-        for _ in range(step - 1):
-            capture.grab()
-        success, frame = capture.read()
-        if not success:  # video habis
-            return
-        yield frame
+    capture = cv2.VideoCapture(str(video_path))
+    fps = capture.get(cv2.CAP_PROP_FPS) or FALLBACK_VIDEO_FPS
+    detect_every = max(1, round(fps / detect_fps))
+
+    total_frames = int(max_seconds * fps)
+    video_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_frames > 0:
+        total_frames = min(total_frames, video_frames)
+
+    model = load_model()
+    max_counts: Counter = Counter()
+    violations: dict[str, set[int]] = {bad: set() for _, bad, _ in EQUIPMENT_CHECKS}
+    detections: list[Detection] = []
+    writer = None
+    frames_written = 0
+    is_portrait = False
+    progress = st.progress(0.0, text="Memproses video...")
+
+    try:
+        for index in range(total_frames):
+            success, frame = capture.read()
+            if not success:  # video habis
+                break
+            frame = limit_size(frame)
+
+            if index % detect_every == 0:
+                detections = detect_objects(model, frame, settings, VIDEO_IMAGE_SIZE)
+                counts = count_by_class(detections)
+                max_counts |= counts  # simpan nilai terbesar tiap kelas
+                for name in violations.keys() & counts.keys():
+                    violations[name].add(int(index / fps))
+
+                done = (index + 1) / total_frames
+                progress.progress(done, text=f"Memproses video... {done:.0%}")
+
+            annotated = draw_detections(frame[..., ::-1], detections)
+            annotated_bgr = np.ascontiguousarray(np.asarray(annotated)[..., ::-1])
+            if writer is None:
+                writer = open_writer(output_path, annotated_bgr, fps)
+                is_portrait = frame.shape[0] > frame.shape[1]
+            writer.send(annotated_bgr)
+            frames_written += 1
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.close()
+        progress.empty()
+
+    if frames_written == 0:
+        raise ValueError("Video tidak bisa dibaca.")
+    seconds = {name: sorted(values) for name, values in violations.items()}
+    return frames_written / fps, max_counts, seconds, is_portrait
+
+
+def add_audio(silent_path: Path, source_path: Path, output_path: Path, duration: float) -> bool:
+    """Menggabungkan suara video asli ke video hasil. False jika gagal."""
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-i", str(silent_path),
+        "-i", str(source_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0?",  # tanda tanya: tidak masalah jika video asli tanpa suara
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-t", f"{duration:.3f}",
+        "-movflags", "+faststart",  # agar browser bisa langsung memutar
+        str(output_path),
+    ]
+    return subprocess.run(command, capture_output=True).returncode == 0
+
+
+def render_video(
+    source: VideoSource, settings: Settings, detect_fps: int, max_seconds: int
+) -> VideoResult:
+    """Memproses video dari awal sampai siap diputar. File sementara dihapus otomatis."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        folder = Path(temp_dir)
+        video_path = get_video_path(source, folder)
+        silent_path = folder / "tanpa_suara.mp4"
+        final_path = folder / "hasil.mp4"
+
+        duration, max_counts, violations, is_portrait = annotate_video(
+            video_path, silent_path, settings, detect_fps, max_seconds
+        )
+        with st.spinner("Menambahkan suara..."):
+            has_audio = add_audio(silent_path, video_path, final_path, duration)
+
+        result_path = final_path if has_audio else silent_path
+        return VideoResult(
+            result_path.read_bytes(), is_portrait, has_audio, max_counts, violations
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +453,9 @@ def show_sidebar() -> Settings:
     return Settings(mode, confidence, match_persons)
 
 
-def show_summary(detections: list[Detection]) -> None:
+def show_summary(counts: Counter, title: str = "Jumlah terdeteksi") -> None:
     """Menampilkan jumlah Helm, Vest, dan Person (selalu tampil, 0 jika tidak ada)."""
-    counts = count_by_class(detections)
-
-    st.subheader("Jumlah terdeteksi")
+    st.subheader(title)
     for column, (class_name, label) in zip(st.columns(3), SUMMARY_LABELS.items()):
         column.metric(label=label, value=counts[class_name])
 
@@ -363,56 +499,12 @@ def run_image_mode(settings: Settings) -> None:
     result_column.subheader("Hasil deteksi")
     result_column.image(draw_detections(np.array(image), detections), use_container_width=True)
 
-    show_summary(detections)
+    show_summary(count_by_class(detections))
 
 
 # ---------------------------------------------------------------------------
 # Mode 2: video (folder videos, YouTube, atau file unggahan)
 # ---------------------------------------------------------------------------
-def run_video_mode(settings: Settings) -> None:
-    """Mode video: pilih sumber video, lalu deteksi secara langsung."""
-    target_fps = st.sidebar.slider(
-        "Frame diproses per detik",
-        min_value=1,
-        max_value=30,
-        value=10,
-        help="Makin besar makin halus tapi makin berat. Video asli 24-30 fps, jadi "
-        "30 berarti setiap frame diproses. Turunkan jika terasa lambat "
-        "(3-5 sudah cukup untuk memantau APD).",
-    )
-    max_seconds = st.sidebar.slider(
-        "Durasi video diproses (detik)",
-        min_value=10,
-        max_value=300,
-        value=60,
-        step=10,
-    )
-
-    source = pick_video()
-    if not st.button("Mulai deteksi", type="primary"):
-        st.info("Atur pengaturan di sidebar, lalu klik **Mulai deteksi**.")
-        return
-    if source.is_empty:
-        st.warning("Isi link YouTube atau unggah file video terlebih dahulu.")
-        return
-
-    try:
-        with open_video(source, YOUTUBE_RESOLUTION) as capture:
-            if capture.isOpened():
-                process_video(capture, settings, target_fps, max_seconds)
-            else:
-                st.error(
-                    "Video tidak bisa dibuka (format mungkin tidak didukung). "
-                    f"Coba video lain atau pilih '{UPLOAD_VIDEO}'."
-                )
-    except yt_dlp.utils.DownloadError:
-        st.error(
-            "Video YouTube tidak bisa diambil. Periksa link atau coba lagi nanti. "
-            f"Di Streamlit Cloud YouTube sering memblokir server; pilih '{UPLOAD_VIDEO}' "
-            "sebagai gantinya."
-        )
-
-
 def pick_video() -> VideoSource:
     """Meminta pengguna memilih video: contoh dari folder, link YouTube, atau unggahan."""
     sample_videos = {
@@ -430,81 +522,73 @@ def pick_video() -> VideoSource:
     return VideoSource(file=sample_videos[choice])
 
 
-def open_youtube(youtube_url: str, resolution: int, folder: str) -> cv2.VideoCapture:
-    """Membuka video YouTube. Jika stream langsung gagal dibuka, unduh dulu ke `folder`."""
-    with st.spinner("Mengambil video dari YouTube..."):
-        capture = cv2.VideoCapture(get_stream_url(youtube_url, resolution))
-        if capture.isOpened():
-            return capture
-        capture.release()
+def show_video_result(result: VideoResult) -> None:
+    """Memutar video hasil, tombol unduh, dan ringkasan deteksi."""
+    # Video vertikal ditaruh di kolom tengah agar tidak terlalu tinggi.
+    player = st.columns([1, 1, 1])[1] if result.is_portrait else st.container()
+    player.video(result.video, format="video/mp4", autoplay=True)
+    if not result.has_audio:
+        st.warning("Suara tidak bisa ditambahkan; video diputar tanpa suara.")
+    st.download_button("Unduh hasil", result.video, "hasil_deteksi.mp4", "video/mp4")
 
-        # Di beberapa server (misalnya cloud) stream langsung tidak terbaca OpenCV,
-        # sedangkan hasil unduhan yt-dlp biasanya terbaca.
-        return cv2.VideoCapture(download_video(youtube_url, resolution, folder))
-
-
-def open_capture(source: VideoSource, resolution: int, folder: str) -> cv2.VideoCapture:
-    """Membuka video dari sumber yang dipilih. `folder` dipakai untuk file sementara."""
-    if source.file is not None:
-        return cv2.VideoCapture(str(source.file))
-
-    if source.upload is not None:
-        video_path = Path(folder) / Path(source.upload.name).name
-        video_path.write_bytes(source.upload.getbuffer())
-        return cv2.VideoCapture(str(video_path))
-
-    return open_youtube(source.youtube_url, resolution, folder)
+    show_summary(result.max_counts, "Jumlah terbanyak dalam satu frame")
+    for _, bad, word in EQUIPMENT_CHECKS:
+        seconds = result.violations[bad]
+        if seconds:
+            st.error(f"Tanpa {word} terdeteksi pada detik: {', '.join(map(str, seconds))}")
 
 
-@contextmanager
-def open_video(source: VideoSource, resolution: int):
-    """Membuka video dan menutupnya otomatis. File sementara dihapus saat selesai."""
-    with tempfile.TemporaryDirectory() as folder:
-        capture = open_capture(source, resolution, folder)
-        try:
-            yield capture
-        finally:
-            capture.release()
+def run_video_mode(settings: Settings) -> None:
+    """Mode video: pilih video, proses seluruhnya, lalu putar hasilnya."""
+    detect_fps = st.sidebar.slider(
+        "Frame diproses per detik",
+        min_value=1,
+        max_value=30,
+        value=5,
+        help="Berapa kali deteksi dijalankan per detik video. Video hasil tetap mulus. "
+        "Makin besar, kotak makin akurat mengikuti gerakan tetapi proses makin lama.",
+    )
+    max_seconds = st.sidebar.slider(
+        "Durasi video diproses (detik)",
+        min_value=10,
+        max_value=300,
+        value=30,
+        step=10,
+        help="Dihitung dari awal video. Makin panjang, makin lama menunggu.",
+    )
 
-
-def process_video(
-    capture: cv2.VideoCapture, settings: Settings, target_fps: int, max_seconds: int
-) -> None:
-    """Mendeteksi frame demi frame dan menampilkannya secara langsung."""
-    model = load_model()
-    video_fps = capture.get(cv2.CAP_PROP_FPS) or FALLBACK_VIDEO_FPS
-    step = max(1, round(video_fps / target_fps))  # ambil 1 dari setiap `step` frame
-    effective_fps = video_fps / step  # FPS yang benar-benar diproses & ditampilkan
-    seconds_per_frame = 1 / effective_fps
-
-    # Jumlah frame yang akan diproses (video pendek bisa lebih kecil dari batas durasi).
-    video_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    max_frames = int(max_seconds * effective_fps)
-    total_frames = min(max_frames, video_frames // step) if video_frames > 0 else max_frames
-
-    progress = st.progress(0.0)
-    frame_box = st.empty()
-    summary_box = st.empty()
-
-    for number, frame in enumerate(sample_frames(capture, step, max_frames), start=1):
-        started_at = time.perf_counter()
-
-        detections = detect_objects(model, frame, settings, VIDEO_IMAGE_SIZE)
-        frame_rgb = frame[..., ::-1]  # frame OpenCV berformat BGR -> RGB
-        frame_box.image(
-            draw_detections(frame_rgb, detections),
-            use_container_width=True,
-            output_format="JPEG",  # lebih kecil dikirim ke browser untuk frame beresolusi besar
+    source = pick_video()
+    # Hasil disimpan per kombinasi pilihan, jadi tidak diproses ulang saat halaman dimuat ulang.
+    request = None
+    if not source.is_empty:
+        # Simpan nilai biasa (bukan objek Settings): kelas dibuat ulang tiap rerun Streamlit.
+        request = (
+            source.key, settings.confidence, settings.match_persons, detect_fps, max_seconds
         )
-        with summary_box.container():
-            show_summary(detections)
-        progress.progress(min(number / total_frames, 1.0))
 
-        # Jaga kecepatan tayang mendekati waktu asli video (tidak terlalu cepat).
-        elapsed = time.perf_counter() - started_at
-        time.sleep(max(0.0, seconds_per_frame - elapsed))
+    if st.button("Proses video", type="primary"):
+        if source.is_empty:
+            st.warning("Isi link YouTube atau unggah file video terlebih dahulu.")
+            return
+        try:
+            result = render_video(source, settings, detect_fps, max_seconds)
+        except yt_dlp.utils.DownloadError:
+            st.error(
+                "Video YouTube tidak bisa diambil. Periksa link atau coba lagi nanti. "
+                f"Di Streamlit Cloud YouTube sering memblokir server; pilih '{UPLOAD_VIDEO}' "
+                "sebagai gantinya."
+            )
+            return
+        except ValueError:
+            st.error(f"Video tidak bisa dibaca. Coba video lain atau '{UPLOAD_VIDEO}'.")
+            return
+        st.session_state["video_result"] = (request, result)
 
-    st.success("Selesai.")
+    saved = st.session_state.get("video_result")
+    if request is None or saved is None or saved[0] != request:
+        st.info("Klik **Proses video**. Hasilnya diputar setelah proses selesai.")
+        return
+    show_video_result(saved[1])
 
 
 # ---------------------------------------------------------------------------
