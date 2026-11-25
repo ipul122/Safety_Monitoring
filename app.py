@@ -2,7 +2,7 @@
 
 Dua mode (dipilih lewat dropdown "Mode" di sidebar kiri):
     1. Images : unggah foto atau pakai gambar contoh, lalu lihat hasil deteksinya.
-    2. Video  : pilih video (folder videos, link YouTube, atau unggahan). Seluruh
+    2. Video  : pilih video contoh (folder videos) atau unggah file video. Seluruh
                 video diproses dulu, lalu hasilnya diputar mulus beserta suaranya.
 
 Cara menjalankan:
@@ -19,7 +19,6 @@ import cv2
 import imageio_ffmpeg
 import numpy as np
 import streamlit as st
-import yt_dlp
 from PIL import Image
 from ultralytics import YOLO
 
@@ -41,16 +40,10 @@ VIDEO_IMAGE_SIZE = 640  # ukuran masuk model untuk video; lebih kecil = lebih ce
 
 # Video contoh: semua file di folder ini muncul otomatis di dropdown.
 VIDEOS_DIR = Path(__file__).parent / "videos"
-CUSTOM_VIDEO = "Link YouTube lain..."
 UPLOAD_VIDEO = "Unggah file video"
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
 MAX_OUTPUT_SIDE = 1280  # video besar diperkecil agar proses & pemutaran ringan
 FALLBACK_VIDEO_FPS = 25  # dipakai jika FPS video tidak terbaca
-
-# Untuk link YouTube: gambar H.264 (avc1) + suara m4a, dengan sisi terpendek
-# video maksimal sekian piksel (juga untuk video vertikal).
-YOUTUBE_FORMAT = "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-YOUTUBE_RESOLUTION = 480
 
 # Warna kotak deteksi per kelas (RGB)
 BOX_COLORS = {
@@ -92,21 +85,18 @@ class VideoSource:
     """Sumber video yang dipilih pengguna (hanya satu yang terisi)."""
 
     file: Path | None = None  # video contoh dari folder `videos`
-    youtube_url: str = ""  # link YouTube yang diketik pengguna
     upload: object | None = None  # file video yang diunggah pengguna
 
     @property
     def is_empty(self) -> bool:
-        return self.file is None and not self.youtube_url and self.upload is None
+        return self.file is None and self.upload is None
 
     @property
     def key(self) -> str:
         """Penanda unik sumber, untuk tahu apakah hasil tersimpan masih cocok."""
         if self.file is not None:
             return f"file:{self.file.name}:{self.file.stat().st_mtime}"
-        if self.upload is not None:
-            return f"upload:{self.upload.file_id}"
-        return f"youtube:{self.youtube_url}"
+        return f"upload:{self.upload.file_id}"
 
 
 @dataclass(frozen=True)
@@ -270,35 +260,14 @@ def draw_detections(image_rgb: np.ndarray, detections: list[Detection]) -> Image
 # ---------------------------------------------------------------------------
 # Memproses video
 # ---------------------------------------------------------------------------
-def download_youtube(youtube_url: str, folder: Path) -> Path:
-    """Mengunduh video YouTube (gambar + suara) ke `folder`."""
-    options = {
-        "format": YOUTUBE_FORMAT,
-        "format_sort": [f"res:{YOUTUBE_RESOLUTION}"],
-        "merge_output_format": "mp4",
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-        "outtmpl": str(folder / "youtube.%(ext)s"),
-        "quiet": True,
-        "noprogress": True,
-        "noplaylist": True,
-    }
-    with yt_dlp.YoutubeDL(options) as downloader:
-        downloader.download([youtube_url])
-    return next(folder.glob("youtube.*"))
-
-
 def get_video_path(source: VideoSource, folder: Path) -> Path:
-    """Menyediakan file video lokal dari sumber yang dipilih."""
+    """Menyediakan path video. File unggahan disimpan dulu ke `folder`."""
     if source.file is not None:
         return source.file
 
-    if source.upload is not None:
-        path = folder / f"unggahan{Path(source.upload.name).suffix}"
-        path.write_bytes(source.upload.getbuffer())
-        return path
-
-    with st.spinner("Mengunduh video dari YouTube..."):
-        return download_youtube(source.youtube_url, folder)
+    path = folder / f"unggahan{Path(source.upload.name).suffix}"
+    path.write_bytes(source.upload.getbuffer())
+    return path
 
 
 def limit_size(frame: np.ndarray) -> np.ndarray:
@@ -503,22 +472,19 @@ def run_image_mode(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: video (folder videos, YouTube, atau file unggahan)
+# Mode 2: video (folder videos atau file unggahan)
 # ---------------------------------------------------------------------------
 def pick_video() -> VideoSource:
-    """Meminta pengguna memilih video: contoh dari folder, link YouTube, atau unggahan."""
+    """Meminta pengguna memilih video: contoh dari folder atau unggahan sendiri."""
     sample_videos = {
         path.stem: path
         for path in sorted(VIDEOS_DIR.glob("*"))
         if path.suffix[1:].lower() in VIDEO_TYPES
     }
-    choice = st.selectbox("Pilih video", [*sample_videos, CUSTOM_VIDEO, UPLOAD_VIDEO])
+    choice = st.selectbox("Pilih video", [*sample_videos, UPLOAD_VIDEO])
 
     if choice == UPLOAD_VIDEO:
         return VideoSource(upload=st.file_uploader("Unggah video", type=VIDEO_TYPES))
-    if choice == CUSTOM_VIDEO:
-        link = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
-        return VideoSource(youtube_url=link)
     return VideoSource(file=sample_videos[choice])
 
 
@@ -568,19 +534,12 @@ def run_video_mode(settings: Settings) -> None:
 
     if st.button("Proses video", type="primary"):
         if source.is_empty:
-            st.warning("Isi link YouTube atau unggah file video terlebih dahulu.")
+            st.warning("Unggah file video terlebih dahulu.")
             return
         try:
             result = render_video(source, settings, detect_fps, max_seconds)
-        except yt_dlp.utils.DownloadError:
-            st.error(
-                "Video YouTube tidak bisa diambil. Periksa link atau coba lagi nanti. "
-                f"Di Streamlit Cloud YouTube sering memblokir server; pilih '{UPLOAD_VIDEO}' "
-                "sebagai gantinya."
-            )
-            return
         except ValueError:
-            st.error(f"Video tidak bisa dibaca. Coba video lain atau '{UPLOAD_VIDEO}'.")
+            st.error("Video tidak bisa dibaca. Coba file video lain.")
             return
         st.session_state["video_result"] = (request, result)
 

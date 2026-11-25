@@ -9,7 +9,6 @@ torchvision
 
 ultralytics>=8.4
 streamlit>=1.52
-yt-dlp
 imageio-ffmpeg  # membawa ffmpeg untuk membuat video H.264 + suara
 pillow
 numpy
