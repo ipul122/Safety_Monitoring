@@ -2,13 +2,13 @@
 
 Dua mode (dipilih lewat dropdown "Mode" di sidebar kiri):
     1. Images : unggah foto atau pakai gambar contoh, lalu lihat hasil deteksinya.
-    2. Video  : deteksi langsung pada video YouTube atau file video unggahan.
+    2. Video  : deteksi langsung pada video contoh (folder videos), link YouTube,
+                atau file video unggahan.
 
 Cara menjalankan:
     streamlit run app.py
 """
 
-import os
 import tempfile
 import time
 from collections import Counter
@@ -37,23 +37,18 @@ SOURCE_UPLOAD = "Unggah gambar"
 SOURCE_SAMPLE = "Gambar contoh"
 
 IMAGE_SIZE = 800  # sama dengan ukuran gambar saat training (mode gambar)
-# Streamlit Community Cloud menjalankan aplikasi dari folder /mount/src/...
-# Dipakai untuk memilih profil performa bawaan yang lebih ringan di cloud.
-IS_CLOUD = Path(__file__).resolve().parts[:3] == ("/", "mount", "src")
+VIDEO_IMAGE_SIZE = 800  # ukuran masuk model untuk video; turunkan ke 640 jika terasa lambat
 
-# Video bawaan di dropdown: {nama tampilan: link YouTube}
-VIDEO_OPTIONS = {
-    "Video 1 - Keselamatan APD": "https://www.youtube.com/watch?v=LL1e55Dnd_g",
-    "Video 2 - CCTV area konstruksi": "https://www.youtube.com/watch?v=T40KkFDvHng",
-    "Video 3 - Shorts rompi proyek": "https://www.youtube.com/shorts/uKeRYHfQvyg",
-}
+# Video contoh: semua file di folder ini muncul otomatis di dropdown.
+VIDEOS_DIR = Path(__file__).parent / "videos"
 CUSTOM_VIDEO = "Link YouTube lain..."
 UPLOAD_VIDEO = "Unggah file video"
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
 
-# Pilih codec H.264 (avc1) karena paling mudah dibaca OpenCV. Resolusi
-# dibatasi oleh profil performa (lihat PROFILES).
+# Untuk link YouTube: pilih codec H.264 (avc1) karena paling mudah dibaca OpenCV,
+# dengan sisi terpendek video maksimal sekian piksel (juga untuk video vertikal).
 YOUTUBE_FORMAT = "bestvideo[vcodec^=avc1][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
+YOUTUBE_RESOLUTION = 480
 FALLBACK_VIDEO_FPS = 25  # dipakai jika FPS video tidak terbaca
 
 # Warna kotak deteksi per kelas (RGB)
@@ -83,31 +78,25 @@ MIN_INSIDE_RATIO = 0.6
 # Data
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class Profile:
-    """Paket pengaturan performa untuk mode video."""
-
-    model_size: int  # ukuran masuk model (makin kecil makin cepat)
-    video_resolution: int  # sisi terpendek video yang diambil, dalam piksel
-    max_seconds: int  # batas durasi video yang boleh diproses
-    default_fps: int  # frame diproses per detik (nilai awal slider)
-
-
-PROFILES = {
-    "Hemat (disarankan di cloud)": Profile(640, 360, 60, 4),
-    "Seimbang": Profile(640, 480, 120, 8),
-    "Akurat (komputer sendiri)": Profile(800, 1080, 300, 10),
-}
-DEFAULT_PROFILE = "Hemat (disarankan di cloud)" if IS_CLOUD else "Akurat (komputer sendiri)"
-
-
-@dataclass(frozen=True)
 class Settings:
     """Pilihan pengguna di sidebar."""
 
     mode: str
     confidence: float
     match_persons: bool
-    profile: Profile
+
+
+@dataclass(frozen=True)
+class VideoSource:
+    """Sumber video yang dipilih pengguna (hanya satu yang terisi)."""
+
+    file: Path | None = None  # video contoh dari folder `videos`
+    youtube_url: str = ""  # link YouTube yang diketik pengguna
+    upload: object | None = None  # file video yang diunggah pengguna
+
+    @property
+    def is_empty(self) -> bool:
+        return self.file is None and not self.youtube_url and self.upload is None
 
 
 @dataclass(frozen=True)
@@ -131,9 +120,7 @@ def load_model() -> YOLO:
 
 def detect_objects(model: YOLO, image, settings: Settings, image_size: int) -> list[Detection]:
     """Mendeteksi objek pada satu gambar (PIL) atau satu frame video (array BGR)."""
-    result = model.predict(
-        image, conf=settings.confidence, imgsz=image_size, verbose=False
-    )[0]
+    result = model.predict(image, conf=settings.confidence, imgsz=image_size, verbose=False)[0]
     detections = [
         Detection(result.names[int(class_id)], float(score), tuple(box))
         for box, class_id, score in zip(
@@ -165,7 +152,10 @@ def find_owner(item: Detection, persons: list[Detection]) -> int | None:
 
 
 def resolve_conflicts(items: list[Detection]) -> list[Detection]:
-    """Jika satu person terdeteksi 'helm' sekaligus 'tanpa helm' (atau vest), ambil yang skornya lebih tinggi."""
+    """Jika satu person terdeteksi 'helm' dan 'tanpa helm' sekaligus, ambil skor tertinggi.
+
+    Berlaku juga untuk vest dan 'tanpa vest'.
+    """
     for good, bad, _ in EQUIPMENT_CHECKS:
         best_good = max((i.score for i in items if i.name == good), default=0.0)
         best_bad = max((i.score for i in items if i.name == bad), default=0.0)
@@ -261,19 +251,29 @@ def draw_detections(image_rgb: np.ndarray, detections: list[Detection]) -> Image
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_stream_url(youtube_url: str, resolution: int) -> str:
-    """Mengambil alamat stream langsung dari link YouTube (tanpa mengunduh).
+    """Mengambil alamat stream langsung dari link YouTube (tanpa mengunduh)."""
+    with yt_dlp.YoutubeDL(youtube_options(resolution)) as downloader:
+        info = downloader.extract_info(youtube_url, download=False)
+    return info["url"]
 
-    `resolution` = batas sisi terpendek video (berlaku juga untuk video vertikal).
-    """
-    options = {
+
+def download_video(youtube_url: str, resolution: int, folder: str) -> str:
+    """Mengunduh video YouTube ke `folder`. Mengembalikan path file hasil unduhan."""
+    options = {**youtube_options(resolution), "outtmpl": f"{folder}/video.%(ext)s"}
+    with yt_dlp.YoutubeDL(options) as downloader:
+        info = downloader.extract_info(youtube_url, download=True)
+        return downloader.prepare_filename(info)
+
+
+def youtube_options(resolution: int) -> dict:
+    """Pengaturan yt-dlp. `resolution` = batas sisi terpendek (juga untuk video vertikal)."""
+    return {
         "format": YOUTUBE_FORMAT,
         "format_sort": [f"res:{resolution}"],
         "quiet": True,
+        "noprogress": True,
         "noplaylist": True,
     }
-    with yt_dlp.YoutubeDL(options) as downloader:
-        info = downloader.extract_info(youtube_url, download=False)
-    return info["url"]
 
 
 def sample_frames(capture: cv2.VideoCapture, step: int, max_frames: int):
@@ -312,17 +312,7 @@ def show_sidebar() -> Settings:
         help="Helm/vest hanya dihitung jika berada di dalam seorang person, "
         "dan tiap person diberi status APD-nya. Matikan untuk melihat hasil mentah model.",
     )
-
-    profile_name = DEFAULT_PROFILE
-    if mode == MODE_VIDEO:
-        profile_name = st.sidebar.selectbox(
-            "Profil performa",
-            list(PROFILES),
-            index=list(PROFILES).index(DEFAULT_PROFILE),
-            help="Hemat: ringan dan aman untuk Streamlit Cloud (video 360p, model 640). "
-            "Akurat: resolusi video tinggi dan model 800, cocok untuk komputer sendiri.",
-        )
-    return Settings(mode, confidence, match_persons, PROFILES[profile_name])
+    return Settings(mode, confidence, match_persons)
 
 
 def show_summary(detections: list[Detection]) -> None:
@@ -339,9 +329,7 @@ def show_summary(detections: list[Detection]) -> None:
 # ---------------------------------------------------------------------------
 def pick_image() -> Image.Image | None:
     """Meminta pengguna memilih gambar: unggah sendiri atau gambar contoh."""
-    source = st.radio(
-        "Sumber gambar", [SOURCE_UPLOAD, SOURCE_SAMPLE], horizontal=True
-    )
+    source = st.radio("Sumber gambar", [SOURCE_UPLOAD, SOURCE_SAMPLE], horizontal=True)
 
     if source == SOURCE_UPLOAD:
         uploaded_file = st.file_uploader("Unggah gambar", type=ALLOWED_TYPES)
@@ -361,6 +349,7 @@ def pick_image() -> Image.Image | None:
 
 
 def run_image_mode(settings: Settings) -> None:
+    """Mode gambar: pilih gambar, deteksi, lalu tampilkan hasilnya."""
     image = pick_image()
     if image is None:
         return
@@ -378,15 +367,15 @@ def run_image_mode(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: video YouTube
+# Mode 2: video (folder videos, YouTube, atau file unggahan)
 # ---------------------------------------------------------------------------
 def run_video_mode(settings: Settings) -> None:
-    profile = settings.profile
+    """Mode video: pilih sumber video, lalu deteksi secara langsung."""
     target_fps = st.sidebar.slider(
         "Frame diproses per detik",
         min_value=1,
         max_value=30,
-        value=profile.default_fps,
+        value=10,
         help="Makin besar makin halus tapi makin berat. Video asli 24-30 fps, jadi "
         "30 berarti setiap frame diproses. Turunkan jika terasa lambat "
         "(3-5 sudah cukup untuk memantau APD).",
@@ -394,25 +383,28 @@ def run_video_mode(settings: Settings) -> None:
     max_seconds = st.sidebar.slider(
         "Durasi video diproses (detik)",
         min_value=10,
-        max_value=profile.max_seconds,
-        value=min(60, profile.max_seconds),
+        max_value=300,
+        value=60,
         step=10,
     )
 
-    youtube_url, uploaded_video = pick_video()
+    source = pick_video()
     if not st.button("Mulai deteksi", type="primary"):
         st.info("Atur pengaturan di sidebar, lalu klik **Mulai deteksi**.")
         return
-    if not youtube_url and uploaded_video is None:
+    if source.is_empty:
         st.warning("Isi link YouTube atau unggah file video terlebih dahulu.")
         return
 
     try:
-        with open_video(youtube_url, uploaded_video, profile.video_resolution) as capture:
+        with open_video(source, YOUTUBE_RESOLUTION) as capture:
             if capture.isOpened():
                 process_video(capture, settings, target_fps, max_seconds)
             else:
-                st.error("Video tidak bisa dibuka.")
+                st.error(
+                    "Video tidak bisa dibuka (format mungkin tidak didukung). "
+                    f"Coba video lain atau pilih '{UPLOAD_VIDEO}'."
+                )
     except yt_dlp.utils.DownloadError:
         st.error(
             "Video YouTube tidak bisa diambil. Periksa link atau coba lagi nanti. "
@@ -421,43 +413,58 @@ def run_video_mode(settings: Settings) -> None:
         )
 
 
-def pick_video():
-    """Meminta pengguna memilih sumber video.
+def pick_video() -> VideoSource:
+    """Meminta pengguna memilih video: contoh dari folder, link YouTube, atau unggahan."""
+    sample_videos = {
+        path.stem: path
+        for path in sorted(VIDEOS_DIR.glob("*"))
+        if path.suffix[1:].lower() in VIDEO_TYPES
+    }
+    choice = st.selectbox("Pilih video", [*sample_videos, CUSTOM_VIDEO, UPLOAD_VIDEO])
 
-    Mengembalikan (link YouTube, file unggahan); salah satunya kosong.
-    """
-    choice = st.selectbox("Pilih video", [*VIDEO_OPTIONS, CUSTOM_VIDEO, UPLOAD_VIDEO])
     if choice == UPLOAD_VIDEO:
-        return "", st.file_uploader("Unggah video", type=VIDEO_TYPES)
+        return VideoSource(upload=st.file_uploader("Unggah video", type=VIDEO_TYPES))
     if choice == CUSTOM_VIDEO:
         link = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
-        return link, None
-    return VIDEO_OPTIONS[choice], None
+        return VideoSource(youtube_url=link)
+    return VideoSource(file=sample_videos[choice])
+
+
+def open_youtube(youtube_url: str, resolution: int, folder: str) -> cv2.VideoCapture:
+    """Membuka video YouTube. Jika stream langsung gagal dibuka, unduh dulu ke `folder`."""
+    with st.spinner("Mengambil video dari YouTube..."):
+        capture = cv2.VideoCapture(get_stream_url(youtube_url, resolution))
+        if capture.isOpened():
+            return capture
+        capture.release()
+
+        # Di beberapa server (misalnya cloud) stream langsung tidak terbaca OpenCV,
+        # sedangkan hasil unduhan yt-dlp biasanya terbaca.
+        return cv2.VideoCapture(download_video(youtube_url, resolution, folder))
+
+
+def open_capture(source: VideoSource, resolution: int, folder: str) -> cv2.VideoCapture:
+    """Membuka video dari sumber yang dipilih. `folder` dipakai untuk file sementara."""
+    if source.file is not None:
+        return cv2.VideoCapture(str(source.file))
+
+    if source.upload is not None:
+        video_path = Path(folder) / Path(source.upload.name).name
+        video_path.write_bytes(source.upload.getbuffer())
+        return cv2.VideoCapture(str(video_path))
+
+    return open_youtube(source.youtube_url, resolution, folder)
 
 
 @contextmanager
-def open_video(youtube_url: str, uploaded_video, resolution: int):
-    """Membuka video (YouTube atau file unggahan) dan menutupnya otomatis."""
-    temp_path = None
-    try:
-        if uploaded_video is not None:
-            suffix = Path(uploaded_video.name).suffix
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_file.write(uploaded_video.getbuffer())
-                temp_path = temp_file.name
-            source = temp_path
-        else:
-            with st.spinner("Mengambil video dari YouTube..."):
-                source = get_stream_url(youtube_url, resolution)
-
-        capture = cv2.VideoCapture(source)
+def open_video(source: VideoSource, resolution: int):
+    """Membuka video dan menutupnya otomatis. File sementara dihapus saat selesai."""
+    with tempfile.TemporaryDirectory() as folder:
+        capture = open_capture(source, resolution, folder)
         try:
             yield capture
         finally:
             capture.release()
-    finally:
-        if temp_path is not None:
-            os.remove(temp_path)  # hapus salinan sementara file unggahan
 
 
 def process_video(
@@ -482,7 +489,7 @@ def process_video(
     for number, frame in enumerate(sample_frames(capture, step, max_frames), start=1):
         started_at = time.perf_counter()
 
-        detections = detect_objects(model, frame, settings, settings.profile.model_size)
+        detections = detect_objects(model, frame, settings, VIDEO_IMAGE_SIZE)
         frame_rgb = frame[..., ::-1]  # frame OpenCV berformat BGR -> RGB
         frame_box.image(
             draw_detections(frame_rgb, detections),

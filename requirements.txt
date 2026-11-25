@@ -11,3 +11,5 @@ ultralytics>=8.4
 streamlit>=1.52
 yt-dlp
 pillow
+numpy
+opencv-python
