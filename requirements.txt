@@ -1,0 +1,13 @@
+# Dependensi untuk Streamlit Community Cloud.
+# File ini diprioritaskan di atas pyproject.toml (poetry) saat deploy.
+
+# PyTorch versi CPU saja. Versi biasa dari PyPI membawa pustaka CUDA
+# (beberapa GB) yang tidak dipakai dan bisa melebihi batas resource cloud.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+
+ultralytics>=8.4
+streamlit>=1.52
+yt-dlp
+pillow
