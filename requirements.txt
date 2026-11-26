@@ -7,7 +7,10 @@
 torch
 torchvision
 
-ultralytics>=8.4
+# Minimal 8.4.218: versi ini membatasi thread ONNX sesuai jatah CPU server.
+ultralytics>=8.4.218
+onnx
+onnxruntime
 streamlit>=1.52
 imageio-ffmpeg  # membawa ffmpeg untuk membuat video H.264 + suara
 pillow

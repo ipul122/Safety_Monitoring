@@ -110,7 +110,7 @@ Prosesnya tercatat di [notebook pelatihan](src/safety_monitoring/train/Capstone_
 
 ## 🧰 Teknologi
 
-**Python** · **Ultralytics YOLO** · **PyTorch** · **OpenCV** · **Streamlit** · **FFmpeg** · **Poetry**
+**Python** · **Ultralytics YOLO** · **PyTorch** · **ONNX Runtime** · **OpenCV** · **Streamlit** · **FFmpeg** · **Poetry**
 
 ---
 
@@ -140,7 +140,7 @@ Safety_Monitoring/
 ├── videos/                # Video contoh
 ├── docs/                  # Gambar untuk dokumentasi
 ├── src/safety_monitoring/
-│   ├── model/             # Model terlatih (best.pt) dan hasil pelatihan
+│   ├── model/             # Model terlatih (best.pt, best.onnx) dan hasil pelatihan
 │   └── train/             # Notebook pelatihan
 ├── pyproject.toml         # Dependensi (Poetry)
 ├── requirements.txt       # Dependensi (cloud)
