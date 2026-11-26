@@ -13,7 +13,6 @@ import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, replace
-from importlib.util import find_spec
 from pathlib import Path
 
 import cv2
@@ -26,22 +25,18 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 # Pengaturan
 # ---------------------------------------------------------------------------
-MODEL_DIR = Path(__file__).parent / "src" / "safety_monitoring" / "model"
-PT_MODEL_PATH = MODEL_DIR / "best.pt"  # mode gambar (PyTorch, ukuran 800)
-ONNX_MODEL_PATH = MODEL_DIR / "best.onnx"  # mode video (lebih cepat di CPU)
+MODEL_PATH = Path(__file__).parent / "src" / "safety_monitoring" / "model" / "best.onnx"
 IMAGES_DIR = Path(__file__).parent / "images"  # gambar contoh
 ALLOWED_TYPES = ["jpg", "jpeg", "png"]
+# Ukuran masuk model. Harus sama dengan `imgsz` saat ekspor ONNX (lihat
+# convert.py di folder model), karena ukuran input ONNX-nya tetap.
+MODEL_IMAGE_SIZE = 640
 
 # Pilihan di dropdown sidebar & sumber gambar
 MODE_IMAGES = "Images"
 MODE_VIDEO = "Video"
 SOURCE_UPLOAD = "Unggah gambar"
 SOURCE_SAMPLE = "Gambar contoh"
-
-IMAGE_SIZE = 800  # sama dengan ukuran gambar saat training (mode gambar)
-# Ukuran masuk model untuk video. Harus sama dengan `imgsz` saat ekspor ONNX
-# (lihat convert.py di folder model), karena ukuran input ONNX-nya tetap.
-VIDEO_IMAGE_SIZE = 640
 
 # Video contoh: semua file di folder ini muncul otomatis di dropdown.
 VIDEOS_DIR = Path(__file__).parent / "videos"
@@ -129,22 +124,16 @@ class Detection:
 # Deteksi
 # ---------------------------------------------------------------------------
 @st.cache_resource
-def load_model(path: Path) -> YOLO:
-    """Memuat model YOLO (.pt atau .onnx) sekali saja agar aplikasi tetap cepat."""
-    return YOLO(str(path), task="detect")
+def load_model() -> YOLO:
+    """Memuat model ONNX sekali saja agar aplikasi tetap cepat."""
+    return YOLO(str(MODEL_PATH), task="detect")
 
 
-def video_model_path() -> Path:
-    """Model ONNX jika file dan library-nya tersedia; jika tidak, model PyTorch."""
-    has_onnx_libraries = all(find_spec(name) for name in ("onnx", "onnxruntime"))
-    if has_onnx_libraries and ONNX_MODEL_PATH.exists():
-        return ONNX_MODEL_PATH
-    return PT_MODEL_PATH
-
-
-def detect_objects(model: YOLO, image, settings: Settings, image_size: int) -> list[Detection]:
+def detect_objects(model: YOLO, image, settings: Settings) -> list[Detection]:
     """Mendeteksi objek pada satu gambar (PIL) atau satu frame video (array BGR)."""
-    result = model.predict(image, conf=settings.confidence, imgsz=image_size, verbose=False)[0]
+    result = model.predict(
+        image, conf=settings.confidence, imgsz=MODEL_IMAGE_SIZE, verbose=False
+    )[0]
     detections = [
         Detection(result.names[int(class_id)], float(score), tuple(box))
         for box, class_id, score in zip(
@@ -326,7 +315,7 @@ def annotate_video(
     if video_frames > 0:
         total_frames = min(total_frames, video_frames)
 
-    model = load_model(video_model_path())
+    model = load_model()
     max_counts: Counter = Counter()
     violations: dict[str, set[int]] = {bad: set() for _, bad, _ in EQUIPMENT_CHECKS}
     detections: list[Detection] = []
@@ -343,7 +332,7 @@ def annotate_video(
             frame = limit_size(frame)
 
             if index % detect_every == 0:
-                detections = detect_objects(model, frame, settings, VIDEO_IMAGE_SIZE)
+                detections = detect_objects(model, frame, settings)
                 counts = count_by_class(detections)
                 max_counts |= counts  # simpan nilai terbesar tiap kelas
                 for name in violations.keys() & counts.keys():
@@ -473,7 +462,7 @@ def run_image_mode(settings: Settings) -> None:
         return
 
     with st.spinner("Mendeteksi..."):
-        detections = detect_objects(load_model(PT_MODEL_PATH), image, settings, IMAGE_SIZE)
+        detections = detect_objects(load_model(), image, settings)
 
     original_column, result_column = st.columns(2)
     original_column.subheader("Gambar asli")
@@ -535,7 +524,6 @@ def run_video_mode(settings: Settings) -> None:
         step=10,
         help="Dihitung dari awal video. Makin panjang, makin lama menunggu.",
     )
-    st.sidebar.caption(f"Model video: {video_model_path().name}")
 
     source = pick_video()
     # Hasil disimpan per kombinasi pilihan, jadi tidak diproses ulang saat halaman dimuat ulang.
