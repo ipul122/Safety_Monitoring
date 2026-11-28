@@ -2,6 +2,8 @@
 
 **Aplikasi berbasis AI yang memeriksa apakah pekerja memakai helm dan rompi keselamatan, dari foto maupun video.**
 
+Link : https://safetymonitoring-cp4anwar.streamlit.app/
+
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![YOLO](https://img.shields.io/badge/Model-YOLO26s-111F68)
 ![Streamlit](https://img.shields.io/badge/App-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
